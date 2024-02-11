@@ -1,4 +1,4 @@
-## What to do
+## TODO
 
 - Liquidity Providers can deposit and withdraw liquidity.
     1. deposit or mint USDC/share

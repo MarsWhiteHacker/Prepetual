@@ -124,25 +124,41 @@ contract PerpetualTest is Test {
         perpetual.withdraw(0, PLAYER, PLAYER);
     }
 
-    function testShouldRevertOnWithdrawingMoreThanLiquidity() public skipSepolia playerDepositedAsset {
+    function testShouldRevertOnWithdrawingMoreThanLiquidity()
+        public
+        skipSepolia
+        playerDepositedAsset
+    {
         vm.prank(PLAYER);
-        vm.expectRevert(Perpetual.Perpetual__AssetsAmountBiggerThanLiquidity.selector);
+        vm.expectRevert(
+            Perpetual.Perpetual__AssetsAmountBiggerThanLiquidity.selector
+        );
         perpetual.withdraw(MINT_ASSET_AMOUNT + 1, PLAYER, PLAYER);
     }
 
-    function testShouldRevertOnWithdrawingBelowReservesLiquidityThreshold() public skipSepolia playerDepositedAsset {
+    function testShouldRevertOnWithdrawingBelowReservesLiquidityThreshold()
+        public
+        skipSepolia
+        playerDepositedAsset
+    {
         ERC20Mock assetERC20 = ERC20Mock(asset);
 
         assertEq((assetERC20).balanceOf(PLAYER), 0);
         assertEq(assetERC20.balanceOf(address(perpetual)), MINT_ASSET_AMOUNT);
 
         vm.startPrank(PLAYER);
-        vm.expectRevert(Perpetual.Perpetual__LiquidityReservesBelowThreshold.selector);
+        vm.expectRevert(
+            Perpetual.Perpetual__LiquidityReservesBelowThreshold.selector
+        );
         perpetual.withdraw(MINT_ASSET_AMOUNT, PLAYER, PLAYER);
         vm.stopPrank();
     }
 
-    function testShouldWithdrawSuccessfully() public skipSepolia playerDepositedAsset {
+    function testShouldWithdrawSuccessfully()
+        public
+        skipSepolia
+        playerDepositedAsset
+    {
         ERC20Mock assetERC20 = ERC20Mock(asset);
         uint256 WITHDRAW_AMOUNT = MINT_ASSET_AMOUNT - 1;
 
@@ -166,7 +182,23 @@ contract PerpetualTest is Test {
         assertFalse(perpetual.checkLiquidityReservesThreshold());
     }
 
-    function testShouldHaveValidLiquidityReservesThresholdAfterFirstDeposit() public skipSepolia playerDepositedAsset {
+    function testShouldHaveValidLiquidityReservesThresholdAfterFirstDeposit()
+        public
+        skipSepolia
+        playerDepositedAsset
+    {
         assertTrue(perpetual.checkLiquidityReservesThreshold());
+    }
+
+    function testShouldRevertOnMint() public {
+        vm.prank(PLAYER);
+        vm.expectRevert(Perpetual.Perpetual__PublicMintIsNowAllowed.selector);
+        perpetual.mint(MINT_ASSET_AMOUNT, PLAYER);
+    }
+
+    function testShouldRevertOnRedeem() public {
+        vm.prank(PLAYER);
+        vm.expectRevert(Perpetual.Perpetual__PublicRedeemIsNowAllowed.selector);
+        perpetual.redeem(MINT_ASSET_AMOUNT, PLAYER, PLAYER);
     }
 }
