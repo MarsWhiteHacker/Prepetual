@@ -140,6 +140,21 @@ contract PerpetualTest is Test {
         assertEq(perpetual.balanceOf(PLAYER), MINT_ASSET_AMOUNT);
     }
 
+    function testX() public skipSepolia mintAssetToPlayer {
+        ERC20Mock assetERC20 = ERC20Mock(asset);
+        vm.startPrank(PLAYER);
+        assetERC20.approve(address(perpetual), 1);
+        vm.expectEmit(true, true, false, false);
+        emit UpdatedDepositedLiquidity(0, 1);
+        perpetual.deposit(1, PLAYER);
+        vm.stopPrank();
+
+        assertEq(assetERC20.balanceOf(address(perpetual)), 1);
+        assertEq(perpetual.depositedLiquidity(), 1);
+        assertEq(perpetual.totalSupply(), 1);
+        assertEq(perpetual.balanceOf(PLAYER), 1);
+    }
+
     function testShouldHaveSameSharesAmountForTwoDepositors()
         public
         skipSepolia
