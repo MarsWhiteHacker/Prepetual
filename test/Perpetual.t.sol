@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: UNLICENSED
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
 import {Test, console} from "forge-std/Test.sol";
@@ -18,6 +18,13 @@ contract PerpetualTest is Test {
         uint256 indexed amount,
         address indexed sender,
         bool indexed isLong
+    );
+    event DecreasedCollateral(uint256 indexed amount, address indexed sender);
+    event DecreasedPosition(
+        uint256 indexed amount,
+        int256 indexed pnl,
+        address indexed sender,
+        bool isLong
     );
 
     Perpetual public perpetual;
@@ -599,6 +606,504 @@ contract PerpetualTest is Test {
                 perpetual.getUserShortOpenInterest(PLAYER2)
             ),
             type(int256).max
+        );
+    }
+
+    function testUserShouldDecreaseCollateralSuccessfullyWithoutOpenPosition()
+        public
+        skipSepolia
+        playerDepositedAsset
+    {
+        uint256 COLLATERAL_SIZE = MINT_ASSET_AMOUNT;
+
+        ERC20Mock(asset).mint(PLAYER2, COLLATERAL_SIZE);
+        vm.startPrank(PLAYER2);
+        ERC20Mock(asset).approve(address(perpetual), COLLATERAL_SIZE);
+        perpetual.addCollateral(COLLATERAL_SIZE);
+        vm.stopPrank();
+
+        assertEq(ERC20Mock(asset).balanceOf(PLAYER2), 0);
+        assertEq(
+            ERC20Mock(asset).balanceOf(address(perpetual)),
+            MINT_ASSET_AMOUNT + COLLATERAL_SIZE
+        );
+        assertEq(perpetual.getUserCollatral(PLAYER2), COLLATERAL_SIZE);
+
+        vm.startPrank(PLAYER2);
+        vm.expectEmit(true, true, false, false);
+        emit DecreasedCollateral(COLLATERAL_SIZE, PLAYER2);
+        perpetual.decreaseCollateral(COLLATERAL_SIZE);
+        vm.stopPrank();
+
+        assertEq(ERC20Mock(asset).balanceOf(PLAYER2), COLLATERAL_SIZE);
+        assertEq(
+            ERC20Mock(asset).balanceOf(address(perpetual)),
+            MINT_ASSET_AMOUNT
+        );
+        assertEq(perpetual.getUserCollatral(PLAYER2), 0);
+    }
+
+    function testUserShouldFailToDecreaseTooLargeCollateral()
+        public
+        skipSepolia
+        playerDepositedAsset
+    {
+        uint256 COLLATERAL_SIZE = MINT_ASSET_AMOUNT;
+
+        vm.startPrank(PLAYER2);
+        vm.expectRevert(Perpetual.Perpetual__NotEnoughCollateral.selector);
+        perpetual.decreaseCollateral(1);
+        vm.stopPrank();
+
+        ERC20Mock(asset).mint(PLAYER2, COLLATERAL_SIZE);
+        vm.startPrank(PLAYER2);
+        ERC20Mock(asset).approve(address(perpetual), COLLATERAL_SIZE);
+        perpetual.addCollateral(COLLATERAL_SIZE);
+        vm.stopPrank();
+
+        vm.startPrank(PLAYER2);
+        vm.expectRevert(Perpetual.Perpetual__NotEnoughCollateral.selector);
+        perpetual.decreaseCollateral(COLLATERAL_SIZE + 1);
+        vm.stopPrank();
+    }
+
+    function testUserShouldFailToDecreaseCollateralThatCoversPosition()
+        public
+        skipSepolia
+        playerDepositedAsset
+        playerDepositedAsset
+    {
+        uint256 POISTION_SIZE = MINT_ASSET_AMOUNT * 2;
+        uint256 COLLATERAL_SIZE = MINT_ASSET_AMOUNT;
+
+        ERC20Mock(asset).mint(PLAYER2, COLLATERAL_SIZE);
+        vm.startPrank(PLAYER2);
+        ERC20Mock(asset).approve(address(perpetual), COLLATERAL_SIZE);
+        perpetual.addCollateral(COLLATERAL_SIZE);
+        perpetual.addPosition(POISTION_SIZE, true);
+        vm.stopPrank();
+
+        assertEq(
+            perpetual.currentUserLeverage(
+                PLAYER2,
+                perpetual.getUserLongOpenInterest(PLAYER2)
+            ),
+            int256((POISTION_SIZE * 1e18) / COLLATERAL_SIZE)
+        );
+
+        vm.startPrank(PLAYER2);
+        perpetual.decreaseCollateral(COLLATERAL_SIZE / 2);
+        vm.stopPrank();
+
+        assertEq(
+            perpetual.currentUserLeverage(
+                PLAYER2,
+                perpetual.getUserLongOpenInterest(PLAYER2)
+            ),
+            int256(((POISTION_SIZE * 1e18) / COLLATERAL_SIZE) * 2)
+        );
+
+        vm.startPrank(PLAYER2);
+        vm.expectRevert(
+            Perpetual.Perpetual__CollateralBelowMaxLeverage.selector
+        );
+        perpetual.decreaseCollateral(COLLATERAL_SIZE / 2);
+        vm.stopPrank();
+    }
+
+    function testShouldFailWhenDecreasingPositionWithNotEnoughTokens()
+        public
+        skipSepolia
+        playerDepositedAsset
+    {
+        vm.startPrank(PLAYER2);
+        vm.expectRevert(
+            Perpetual.Perpetual__NotEnoughIndexTokensInPosition.selector
+        );
+        perpetual.decreasePosition(1, true);
+        vm.expectRevert(
+            Perpetual.Perpetual__NotEnoughIndexTokensInPosition.selector
+        );
+        perpetual.decreasePosition(1, false);
+        vm.stopPrank();
+
+        ERC20Mock(asset).mint(PLAYER2, MINT_ASSET_AMOUNT);
+        vm.startPrank(PLAYER2);
+        ERC20Mock(asset).approve(address(perpetual), MINT_ASSET_AMOUNT);
+        perpetual.addCollateral(MINT_ASSET_AMOUNT);
+        perpetual.addPosition(MINT_ASSET_AMOUNT, true);
+        vm.stopPrank();
+
+        assertEq(
+            perpetual.getUserLongOpenInterestInTokens(PLAYER2),
+            MINT_ASSET_AMOUNT / 10000
+        );
+
+        vm.startPrank(PLAYER2);
+        vm.expectRevert(
+            Perpetual.Perpetual__NotEnoughIndexTokensInPosition.selector
+        );
+        perpetual.decreasePosition(MINT_ASSET_AMOUNT / 10000 + 1, true);
+        vm.stopPrank();
+    }
+
+    function testShouldDecreasePositionSuccessfullyWithNoPnl()
+        public
+        skipSepolia
+        playerDepositedAsset
+    {
+        ERC20Mock(asset).mint(PLAYER2, MINT_ASSET_AMOUNT);
+        vm.startPrank(PLAYER2);
+        ERC20Mock(asset).approve(address(perpetual), MINT_ASSET_AMOUNT);
+        perpetual.addCollateral(MINT_ASSET_AMOUNT);
+        perpetual.addPosition(MINT_ASSET_AMOUNT, true);
+        vm.stopPrank();
+
+        assertEq(perpetual.getUserCollatral(PLAYER2), MINT_ASSET_AMOUNT);
+        assertEq(perpetual.getUserLongOpenInterest(PLAYER2), MINT_ASSET_AMOUNT);
+        assertEq(
+            perpetual.getUserLongOpenInterestInTokens(PLAYER2),
+            MINT_ASSET_AMOUNT / 10000
+        );
+
+        vm.startPrank(PLAYER2);
+        vm.expectEmit(true, true, true, true);
+        emit DecreasedPosition(MINT_ASSET_AMOUNT / 2 / 10000, 0, PLAYER2, true);
+        perpetual.decreasePosition(MINT_ASSET_AMOUNT / 10000 / 2, true);
+        vm.stopPrank();
+
+        assertEq(perpetual.getUserCollatral(PLAYER2), MINT_ASSET_AMOUNT);
+        assertEq(
+            perpetual.getUserLongOpenInterest(PLAYER2),
+            MINT_ASSET_AMOUNT / 2
+        );
+        assertEq(
+            perpetual.getUserLongOpenInterestInTokens(PLAYER2),
+            MINT_ASSET_AMOUNT / 10000 / 2
+        );
+
+        vm.startPrank(PLAYER2);
+        vm.expectEmit(true, true, true, true);
+        emit DecreasedPosition(MINT_ASSET_AMOUNT / 2 / 10000, 0, PLAYER2, true);
+        perpetual.decreasePosition(MINT_ASSET_AMOUNT / 10000 / 2, true);
+        vm.stopPrank();
+
+        assertEq(perpetual.getUserCollatral(PLAYER2), MINT_ASSET_AMOUNT);
+        assertEq(perpetual.getUserLongOpenInterest(PLAYER2), 0);
+        assertEq(perpetual.getUserLongOpenInterestInTokens(PLAYER2), 0);
+    }
+
+    function testShouldFailToDecreasePositionWithInvalidLeverage()
+        public
+        skipSepolia
+        playerDepositedAsset
+    {
+        ERC20Mock(asset).mint(PLAYER2, MINT_ASSET_AMOUNT);
+        vm.startPrank(PLAYER2);
+        ERC20Mock(asset).approve(address(perpetual), MINT_ASSET_AMOUNT);
+        perpetual.addCollateral(MINT_ASSET_AMOUNT / 14);
+        perpetual.addPosition(MINT_ASSET_AMOUNT, true);
+        vm.stopPrank();
+
+        MockV3Aggregator indexTokenPriceFeed = MockV3Aggregator(
+            perpetual.getIndexTokenPriceFeed()
+        );
+        // old price is 10000e8;
+        int256 NEW_INDEX_TOKEN_PRICE = 5000e8;
+        indexTokenPriceFeed.updateAnswer(NEW_INDEX_TOKEN_PRICE);
+
+        vm.startPrank(PLAYER2);
+        vm.expectRevert(
+            Perpetual.Perpetual__CollateralBelowMaxLeverage.selector
+        );
+        perpetual.decreasePosition(MINT_ASSET_AMOUNT / 10000 / 14, true);
+        vm.stopPrank();
+    }
+
+    function testShouldFailToDecreasePositionWithLowDepositValue()
+        public
+        skipSepolia
+        playerDepositedAsset
+    {
+        ERC20Mock(asset).mint(PLAYER2, MINT_ASSET_AMOUNT);
+        vm.startPrank(PLAYER2);
+        ERC20Mock(asset).approve(address(perpetual), MINT_ASSET_AMOUNT);
+        perpetual.addCollateral(MINT_ASSET_AMOUNT / 14);
+        perpetual.addPosition(MINT_ASSET_AMOUNT, true);
+        vm.stopPrank();
+
+        MockV3Aggregator indexTokenPriceFeed = MockV3Aggregator(
+            perpetual.getIndexTokenPriceFeed()
+        );
+        // old price is 10000e8;
+        int256 NEW_INDEX_TOKEN_PRICE = 20000e8;
+        indexTokenPriceFeed.updateAnswer(NEW_INDEX_TOKEN_PRICE);
+
+        vm.startPrank(PLAYER2);
+        vm.expectRevert(
+            Perpetual.Perpetual__LiquidityReservesBelowThreshold.selector
+        );
+        perpetual.decreasePosition(MINT_ASSET_AMOUNT / 10000 / 14, true);
+        vm.stopPrank();
+    }
+
+    function testShouldDecreasePositionWithCorrectProfitForLongPosition()
+        public
+        skipSepolia
+        playerDepositedAsset
+        playerDepositedAsset
+    {
+        ERC20Mock(asset).mint(PLAYER2, MINT_ASSET_AMOUNT);
+        vm.startPrank(PLAYER2);
+        ERC20Mock(asset).approve(address(perpetual), MINT_ASSET_AMOUNT);
+        perpetual.addCollateral(MINT_ASSET_AMOUNT);
+        perpetual.addPosition(MINT_ASSET_AMOUNT, true);
+        vm.stopPrank();
+
+        assertEq(perpetual.depositedLiquidity(), 2 * MINT_ASSET_AMOUNT);
+        assertEq(ERC20Mock(asset).balanceOf(PLAYER2), 0);
+        assertEq(perpetual.getUserCollatral(PLAYER2), MINT_ASSET_AMOUNT);
+        assertEq(perpetual.getUserLongOpenInterest(PLAYER2), MINT_ASSET_AMOUNT);
+        assertEq(
+            perpetual.getUserLongOpenInterestInTokens(PLAYER2),
+            MINT_ASSET_AMOUNT / 10000
+        );
+        assertEq(perpetual.getLongOpenInterest(), MINT_ASSET_AMOUNT);
+        assertEq(
+            perpetual.getLongOpenInterestInTokens(),
+            MINT_ASSET_AMOUNT / 10000
+        );
+
+        MockV3Aggregator indexTokenPriceFeed = MockV3Aggregator(
+            perpetual.getIndexTokenPriceFeed()
+        );
+        int256 OLD_INDEX_TOKEN_PRICE = 10000e8;
+        int256 NEW_INDEX_TOKEN_PRICE = 15000e8;
+        indexTokenPriceFeed.updateAnswer(NEW_INDEX_TOKEN_PRICE);
+
+        uint256 pnl = ((uint256(NEW_INDEX_TOKEN_PRICE) * MINT_ASSET_AMOUNT) /
+            uint256(OLD_INDEX_TOKEN_PRICE)) - MINT_ASSET_AMOUNT;
+        assertEq(int256(pnl), perpetual.countPnl(PLAYER2));
+
+        vm.startPrank(PLAYER2);
+        perpetual.decreasePosition(MINT_ASSET_AMOUNT / 10000 / 4, true);
+        vm.stopPrank();
+
+        assertEq(ERC20Mock(asset).balanceOf(PLAYER2), pnl / 4);
+        assertEq(
+            perpetual.depositedLiquidity(),
+            (2 * MINT_ASSET_AMOUNT) - (pnl / 4)
+        );
+        assertEq(perpetual.getUserCollatral(PLAYER2), MINT_ASSET_AMOUNT);
+        assertEq(
+            perpetual.getUserLongOpenInterest(PLAYER2),
+            (MINT_ASSET_AMOUNT / 4) * 3
+        );
+        assertEq(
+            perpetual.getUserLongOpenInterestInTokens(PLAYER2),
+            (MINT_ASSET_AMOUNT / 10000 / 4) * 3
+        );
+        assertEq(perpetual.getLongOpenInterest(), (MINT_ASSET_AMOUNT / 4) * 3);
+        assertEq(
+            perpetual.getLongOpenInterestInTokens(),
+            (MINT_ASSET_AMOUNT / 10000 / 4) * 3
+        );
+    }
+
+    function testShouldDecreasePositionWithCorrectProfitForShortPosition()
+        public
+        skipSepolia
+        playerDepositedAsset
+        playerDepositedAsset
+    {
+        ERC20Mock(asset).mint(PLAYER2, MINT_ASSET_AMOUNT);
+        vm.startPrank(PLAYER2);
+        ERC20Mock(asset).approve(address(perpetual), MINT_ASSET_AMOUNT);
+        perpetual.addCollateral(MINT_ASSET_AMOUNT);
+        perpetual.addPosition(MINT_ASSET_AMOUNT, false);
+        vm.stopPrank();
+
+        assertEq(perpetual.depositedLiquidity(), 2 * MINT_ASSET_AMOUNT);
+        assertEq(ERC20Mock(asset).balanceOf(PLAYER2), 0);
+        assertEq(perpetual.getUserCollatral(PLAYER2), MINT_ASSET_AMOUNT);
+        assertEq(
+            perpetual.getUserShortOpenInterest(PLAYER2),
+            MINT_ASSET_AMOUNT
+        );
+        assertEq(
+            perpetual.getUserShortOpenInterestInTokens(PLAYER2),
+            MINT_ASSET_AMOUNT / 10000
+        );
+        assertEq(perpetual.getShortOpenInterest(), MINT_ASSET_AMOUNT);
+        assertEq(
+            perpetual.getShortOpenInterestInTokens(),
+            MINT_ASSET_AMOUNT / 10000
+        );
+
+        MockV3Aggregator indexTokenPriceFeed = MockV3Aggregator(
+            perpetual.getIndexTokenPriceFeed()
+        );
+        int256 OLD_INDEX_TOKEN_PRICE = 10000e8;
+        int256 NEW_INDEX_TOKEN_PRICE = 5000e8;
+        indexTokenPriceFeed.updateAnswer(NEW_INDEX_TOKEN_PRICE);
+
+        uint256 pnl = MINT_ASSET_AMOUNT -
+            ((uint256(NEW_INDEX_TOKEN_PRICE) * MINT_ASSET_AMOUNT) /
+                uint256(OLD_INDEX_TOKEN_PRICE));
+        assertEq(int256(pnl), perpetual.countPnl(PLAYER2));
+
+        vm.startPrank(PLAYER2);
+        perpetual.decreasePosition(MINT_ASSET_AMOUNT / 10000 / 4, false);
+        vm.stopPrank();
+
+        assertEq(ERC20Mock(asset).balanceOf(PLAYER2), pnl / 4);
+        assertEq(
+            perpetual.depositedLiquidity(),
+            (2 * MINT_ASSET_AMOUNT) - (pnl / 4)
+        );
+        assertEq(perpetual.getUserCollatral(PLAYER2), MINT_ASSET_AMOUNT);
+        assertEq(
+            perpetual.getUserShortOpenInterest(PLAYER2),
+            (MINT_ASSET_AMOUNT / 4) * 3
+        );
+        assertEq(
+            perpetual.getUserShortOpenInterestInTokens(PLAYER2),
+            (MINT_ASSET_AMOUNT / 10000 / 4) * 3
+        );
+        assertEq(perpetual.getShortOpenInterest(), (MINT_ASSET_AMOUNT / 4) * 3);
+        assertEq(
+            perpetual.getShortOpenInterestInTokens(),
+            (MINT_ASSET_AMOUNT / 10000 / 4) * 3
+        );
+    }
+
+    function testShouldDecreasePositionWithCorrectLossForLongPosition()
+        public
+        skipSepolia
+        playerDepositedAsset
+        playerDepositedAsset
+    {
+        ERC20Mock(asset).mint(PLAYER2, MINT_ASSET_AMOUNT);
+        vm.startPrank(PLAYER2);
+        ERC20Mock(asset).approve(address(perpetual), MINT_ASSET_AMOUNT);
+        perpetual.addCollateral(MINT_ASSET_AMOUNT);
+        perpetual.addPosition(MINT_ASSET_AMOUNT, true);
+        vm.stopPrank();
+
+        assertEq(perpetual.depositedLiquidity(), 2 * MINT_ASSET_AMOUNT);
+        assertEq(ERC20Mock(asset).balanceOf(PLAYER2), 0);
+        assertEq(perpetual.getUserCollatral(PLAYER2), MINT_ASSET_AMOUNT);
+        assertEq(perpetual.getUserLongOpenInterest(PLAYER2), MINT_ASSET_AMOUNT);
+        assertEq(
+            perpetual.getUserLongOpenInterestInTokens(PLAYER2),
+            MINT_ASSET_AMOUNT / 10000
+        );
+        assertEq(perpetual.getLongOpenInterest(), MINT_ASSET_AMOUNT);
+        assertEq(
+            perpetual.getLongOpenInterestInTokens(),
+            MINT_ASSET_AMOUNT / 10000
+        );
+
+        MockV3Aggregator indexTokenPriceFeed = MockV3Aggregator(
+            perpetual.getIndexTokenPriceFeed()
+        );
+        int256 OLD_INDEX_TOKEN_PRICE = 10000e8;
+        int256 NEW_INDEX_TOKEN_PRICE = 5000e8;
+        indexTokenPriceFeed.updateAnswer(NEW_INDEX_TOKEN_PRICE);
+
+        int256 pnl = ((NEW_INDEX_TOKEN_PRICE * int256(MINT_ASSET_AMOUNT)) /
+            OLD_INDEX_TOKEN_PRICE) - int256(MINT_ASSET_AMOUNT);
+        assertEq(int256(pnl), perpetual.countPnl(PLAYER2));
+
+        vm.startPrank(PLAYER2);
+        perpetual.decreasePosition(MINT_ASSET_AMOUNT / 10000 / 4, true);
+        vm.stopPrank();
+
+        assertEq(ERC20Mock(asset).balanceOf(PLAYER2), 0);
+        assertEq(perpetual.depositedLiquidity(), 2 * MINT_ASSET_AMOUNT);
+        assertEq(
+            perpetual.getUserCollatral(PLAYER2),
+            MINT_ASSET_AMOUNT - (uint256(-pnl) / 4)
+        );
+        assertEq(
+            perpetual.getUserLongOpenInterest(PLAYER2),
+            (MINT_ASSET_AMOUNT / 4) * 3
+        );
+        assertEq(
+            perpetual.getUserLongOpenInterestInTokens(PLAYER2),
+            (MINT_ASSET_AMOUNT / 10000 / 4) * 3
+        );
+        assertEq(perpetual.getLongOpenInterest(), (MINT_ASSET_AMOUNT / 4) * 3);
+        assertEq(
+            perpetual.getLongOpenInterestInTokens(),
+            (MINT_ASSET_AMOUNT / 10000 / 4) * 3
+        );
+    }
+
+    function testShouldDecreasePositionWithCorrectLossForShortPosition()
+        public
+        skipSepolia
+        playerDepositedAsset
+        playerDepositedAsset
+    {
+        ERC20Mock(asset).mint(PLAYER2, MINT_ASSET_AMOUNT);
+        vm.startPrank(PLAYER2);
+        ERC20Mock(asset).approve(address(perpetual), MINT_ASSET_AMOUNT);
+        perpetual.addCollateral(MINT_ASSET_AMOUNT);
+        perpetual.addPosition(MINT_ASSET_AMOUNT, false);
+        vm.stopPrank();
+
+        assertEq(perpetual.depositedLiquidity(), 2 * MINT_ASSET_AMOUNT);
+        assertEq(ERC20Mock(asset).balanceOf(PLAYER2), 0);
+        assertEq(perpetual.getUserCollatral(PLAYER2), MINT_ASSET_AMOUNT);
+        assertEq(
+            perpetual.getUserShortOpenInterest(PLAYER2),
+            MINT_ASSET_AMOUNT
+        );
+        assertEq(
+            perpetual.getUserShortOpenInterestInTokens(PLAYER2),
+            MINT_ASSET_AMOUNT / 10000
+        );
+        assertEq(perpetual.getShortOpenInterest(), MINT_ASSET_AMOUNT);
+        assertEq(
+            perpetual.getShortOpenInterestInTokens(),
+            MINT_ASSET_AMOUNT / 10000
+        );
+
+        MockV3Aggregator indexTokenPriceFeed = MockV3Aggregator(
+            perpetual.getIndexTokenPriceFeed()
+        );
+        int256 OLD_INDEX_TOKEN_PRICE = 10000e8;
+        int256 NEW_INDEX_TOKEN_PRICE = 15000e8;
+        indexTokenPriceFeed.updateAnswer(NEW_INDEX_TOKEN_PRICE);
+
+        int256 pnl = int256(MINT_ASSET_AMOUNT) -
+            ((NEW_INDEX_TOKEN_PRICE * int256(MINT_ASSET_AMOUNT)) /
+                OLD_INDEX_TOKEN_PRICE);
+        assertEq(int256(pnl), perpetual.countPnl(PLAYER2));
+
+        vm.startPrank(PLAYER2);
+        perpetual.decreasePosition(MINT_ASSET_AMOUNT / 10000 / 4, false);
+        vm.stopPrank();
+
+        assertEq(ERC20Mock(asset).balanceOf(PLAYER2), 0);
+        assertEq(perpetual.depositedLiquidity(), 2 * MINT_ASSET_AMOUNT);
+        assertEq(
+            perpetual.getUserCollatral(PLAYER2),
+            MINT_ASSET_AMOUNT - (uint256(-pnl) / 4)
+        );
+        assertEq(
+            perpetual.getUserShortOpenInterest(PLAYER2),
+            (MINT_ASSET_AMOUNT / 4) * 3
+        );
+        assertEq(
+            perpetual.getUserShortOpenInterestInTokens(PLAYER2),
+            (MINT_ASSET_AMOUNT / 10000 / 4) * 3
+        );
+        assertEq(perpetual.getShortOpenInterest(), (MINT_ASSET_AMOUNT / 4) * 3);
+        assertEq(
+            perpetual.getShortOpenInterestInTokens(),
+            (MINT_ASSET_AMOUNT / 10000 / 4) * 3
         );
     }
 }

@@ -1,8 +1,9 @@
-// SPDX-License-Identifier: UNLICENSED
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {ERC4626} from "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
@@ -21,9 +22,11 @@ import "forge-std/console.sol";
 contract Perpetual is ERC4626, ReentrancyGuard {
     error Perpetual__WrongDecimals();
     error Perpetual__NotEnoughAssets();
+    error Perpetual__NotEnoughCollateral();
     error Perpetual__PublicMintIsNowAllowed();
     error Perpetual__PublicRedeemIsNowAllowed();
     error Perpetual__CollateralBelowMaxLeverage();
+    error Perpetual__NotEnoughIndexTokensInPosition();
     error Perpetual__LiquidityReservesBelowThreshold();
     error Perpetual__AssetsAmountBiggerThanLiquidity();
 
@@ -56,6 +59,13 @@ contract Perpetual is ERC4626, ReentrancyGuard {
         address indexed sender,
         bool indexed isLong
     );
+    event DecreasedCollateral(uint256 indexed amount, address indexed sender);
+    event DecreasedPosition(
+        uint256 indexed amount,
+        int256 indexed pnl,
+        address indexed sender,
+        bool isLong
+    );
 
     /**
      * @param _asset a token used for deposting by LPs and for collateral
@@ -81,16 +91,16 @@ contract Perpetual is ERC4626, ReentrancyGuard {
     }
 
     /**
-     * Count all deposists made by LPs
+     * Counts all deposists made by LPs
      * Does not count collaterals made by traders
      */
     function totalAssets() public view override returns (uint256) {
         int256 pnl = _countPnl();
 
         if (pnl > 0) {
-            return s_depositedLiquidity - uint256(pnl);
+            return s_depositedLiquidity - SafeCast.toUint256(pnl);
         } else {
-            return s_depositedLiquidity + uint256(-pnl);
+            return s_depositedLiquidity + SafeCast.toUint256(-pnl);
         }
     }
 
@@ -166,9 +176,7 @@ contract Perpetual is ERC4626, ReentrancyGuard {
         uint256 assetPriceFeedDecimals = i_assetPriceFeed.decimals();
         uint256 indexTokenPriceFeedDecimals = i_assetPriceFeed.decimals();
 
-        uint256 generalInterest = s_userToLongOpenInterest[msg.sender] +
-            s_userToShortOpenInterest[msg.sender] +
-            amount;
+        uint256 generalInterest = _generalUserOpenInterest(msg.sender) + amount;
         uint256 indexTokenAmount = (amount *
             _assetTokenToIndexTokenPrice() *
             indexTokenPriceFeedDecimals) / (assetPriceFeedDecimals * PRECISION);
@@ -205,6 +213,124 @@ contract Perpetual is ERC4626, ReentrancyGuard {
         addPosition(positionSize, isLong);
     }
 
+    function decreaseCollateral(uint256 amount) external {
+        uint256 oldCollateral = s_userToCollateral[msg.sender];
+
+        if (amount > oldCollateral) {
+            revert Perpetual__NotEnoughCollateral();
+        }
+
+        uint256 newCollateral;
+        unchecked {
+            newCollateral = oldCollateral - amount;
+        }
+
+        s_userToCollateral[msg.sender] = newCollateral;
+
+        uint256 generalInterest = _generalUserOpenInterest(msg.sender);
+        if (!_isValidLeverage(msg.sender, generalInterest)) {
+            revert Perpetual__CollateralBelowMaxLeverage();
+        }
+
+        SafeERC20.safeTransfer(IERC20(asset()), msg.sender, amount);
+
+        emit DecreasedCollateral(amount, msg.sender);
+    }
+
+    /**
+     * @param indexTokenAmount amount is stated in the index token nominal
+     * @dev PnL to realize is ccounted by the next formula:
+     * realizedPnL = totalPositionPnL * sizeDecrease /  positionSize
+     */
+    function decreasePosition(
+        uint256 indexTokenAmount,
+        bool isLong
+    ) external nonReentrant {
+        uint256 userOpenInterest;
+        uint256 userOpenInterestInTokens;
+        int256 totalPositionPnL;
+
+        if (isLong) {
+            userOpenInterest = s_userToLongOpenInterest[msg.sender];
+            userOpenInterestInTokens = s_userToLongOpenInterestInTokens[
+                msg.sender
+            ];
+            totalPositionPnL = _countLongPnL(msg.sender);
+        } else {
+            userOpenInterest = s_userToShortOpenInterest[msg.sender];
+            userOpenInterestInTokens = s_userToShortOpenInterestInTokens[
+                msg.sender
+            ];
+            totalPositionPnL = _countShortPnL(msg.sender);
+        }
+
+        if (
+            indexTokenAmount > userOpenInterestInTokens ||
+            userOpenInterestInTokens <= 0
+        ) {
+            revert Perpetual__NotEnoughIndexTokensInPosition();
+        }
+
+        int256 realizedPnl = (totalPositionPnL *
+            SafeCast.toInt256(indexTokenAmount)) /
+            SafeCast.toInt256(userOpenInterestInTokens);
+
+        if (realizedPnl > 0) {
+            s_depositedLiquidity -= SafeCast.toUint256(realizedPnl);
+            SafeERC20.safeTransfer(
+                IERC20(asset()),
+                msg.sender,
+                SafeCast.toUint256(realizedPnl)
+            );
+        }
+        if (realizedPnl < 0) {
+            s_userToCollateral[msg.sender] -= SafeCast.toUint256(-realizedPnl);
+        }
+
+        if (isLong) {
+            uint256 longInterest = (s_userToLongOpenInterest[msg.sender] *
+                indexTokenAmount) / userOpenInterestInTokens;
+
+            unchecked {
+                s_userToLongOpenInterest[msg.sender] -= longInterest;
+                s_userToLongOpenInterestInTokens[
+                    msg.sender
+                ] -= indexTokenAmount;
+                s_longOpenInterest -= longInterest;
+                s_longOpenInterestInTokens -= indexTokenAmount;
+            }
+        } else {
+            uint256 shortInterest = (s_userToShortOpenInterest[msg.sender] *
+                indexTokenAmount) / userOpenInterestInTokens;
+
+            unchecked {
+                s_userToShortOpenInterest[msg.sender] -= shortInterest;
+                s_userToShortOpenInterestInTokens[
+                    msg.sender
+                ] -= indexTokenAmount;
+                s_shortOpenInterest -= shortInterest;
+                s_shortOpenInterestInTokens -= indexTokenAmount;
+            }
+        }
+
+        if (
+            !_isValidLeverage(msg.sender, _generalUserOpenInterest(msg.sender))
+        ) {
+            revert Perpetual__CollateralBelowMaxLeverage();
+        }
+
+        if (!_checkLiquidityReservesThreshold()) {
+            revert Perpetual__LiquidityReservesBelowThreshold();
+        }
+
+        emit DecreasedPosition(
+            indexTokenAmount,
+            realizedPnl,
+            msg.sender,
+            isLong
+        );
+    }
+
     /** The ERC4626 mint public function is not allowed */
     function mint(uint256, address) public pure override returns (uint256) {
         revert Perpetual__PublicMintIsNowAllowed();
@@ -217,6 +343,12 @@ contract Perpetual is ERC4626, ReentrancyGuard {
         address
     ) public pure override returns (uint256) {
         revert Perpetual__PublicRedeemIsNowAllowed();
+    }
+
+    function _generalUserOpenInterest(
+        address user
+    ) internal view returns (uint256) {
+        return s_userToLongOpenInterest[user] + s_userToShortOpenInterest[user];
     }
 
     /**
@@ -258,16 +390,18 @@ contract Perpetual is ERC4626, ReentrancyGuard {
 
         if (tokenToCalculatePrice == asset()) {
             return
-                (uint256(assetPriceInUsd) *
+                (SafeCast.toUint256(assetPriceInUsd) *
                     indexTokenPriceFeedDecimals *
                     PRECISION) /
-                (uint256(indexTokenPriceInUsd) * assetPriceFeedDecimals);
+                (SafeCast.toUint256(indexTokenPriceInUsd) *
+                    assetPriceFeedDecimals);
         } else {
             return
-                (uint256(indexTokenPriceInUsd) *
+                (SafeCast.toUint256(indexTokenPriceInUsd) *
                     assetPriceFeedDecimals *
                     PRECISION) /
-                (uint256(assetPriceInUsd) * indexTokenPriceFeedDecimals);
+                (SafeCast.toUint256(assetPriceInUsd) *
+                    indexTokenPriceFeedDecimals);
         }
     }
 
@@ -283,24 +417,24 @@ contract Perpetual is ERC4626, ReentrancyGuard {
 
     function _countLongPnL() internal view returns (int256) {
         return
-            int256(
+            SafeCast.toInt256(
                 (s_longOpenInterestInTokens * _indexTokenToAssetTokenPrice()) /
                     PRECISION
-            ) - int256(s_longOpenInterest);
+            ) - SafeCast.toInt256(s_longOpenInterest);
     }
 
     function _countLongPnL(address user) internal view returns (int256) {
         return
-            int256(
+            SafeCast.toInt256(
                 (s_userToLongOpenInterestInTokens[user] *
                     _indexTokenToAssetTokenPrice()) / PRECISION
-            ) - int256(s_userToLongOpenInterest[user]);
+            ) - SafeCast.toInt256(s_userToLongOpenInterest[user]);
     }
 
     function _countShortPnL() internal view returns (int256) {
         return
-            int256(s_shortOpenInterest) -
-            int256(
+            SafeCast.toInt256(s_shortOpenInterest) -
+            SafeCast.toInt256(
                 (s_shortOpenInterestInTokens * _indexTokenToAssetTokenPrice()) /
                     PRECISION
             );
@@ -308,8 +442,8 @@ contract Perpetual is ERC4626, ReentrancyGuard {
 
     function _countShortPnL(address user) internal view returns (int256) {
         return
-            int256(s_userToShortOpenInterest[user]) -
-            int256(
+            SafeCast.toInt256(s_userToShortOpenInterest[user]) -
+            SafeCast.toInt256(
                 (s_userToShortOpenInterestInTokens[user] *
                     _indexTokenToAssetTokenPrice()) / PRECISION
             );
@@ -329,7 +463,7 @@ contract Perpetual is ERC4626, ReentrancyGuard {
     ) internal view returns (bool) {
         return
             _currentUserLeverage(user, positionAmount) <
-            int256(MAX_LEVERAGE * PRECISION);
+            SafeCast.toInt256(MAX_LEVERAGE * PRECISION);
     }
 
     /** returns leverage with 18 decimals */
@@ -337,14 +471,18 @@ contract Perpetual is ERC4626, ReentrancyGuard {
         address user,
         uint256 positionAmount
     ) internal view returns (int256) {
-        int256 denominator = (int256(s_userToCollateral[user]) +
+        int256 denominator = (SafeCast.toInt256(s_userToCollateral[user]) +
             _countPnl(user));
 
-        if (denominator <= 0) {
+        if (denominator <= 0 && positionAmount > 0) {
             return type(int256).max;
         }
 
-        return int256(positionAmount * PRECISION) / denominator;
+        if (denominator <= 0) {
+            return 0;
+        }
+
+        return SafeCast.toInt256(positionAmount * PRECISION) / denominator;
     }
 
     function currentUserLeverage(
