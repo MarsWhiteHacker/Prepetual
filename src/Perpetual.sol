@@ -33,25 +33,39 @@ contract Perpetual is ERC4626, ReentrancyGuard {
     error Perpetual__LiquidityReservesBelowThreshold();
     error Perpetual__AssetsAmountBiggerThanLiquidity();
 
+    /**
+     * The rate is 10% per year, or 1/315_360_000 per second
+     * Borrowing fee per second = size / BORROWING_PER_SHARE_PER_SECOND
+     */
+    uint256 private constant BORROWING_PER_SHARE_PER_SECOND = 315_360_000;
+    uint256 private constant BORROWING_PRECISION = 1e10;
     uint256 private constant PRECISION = 1e18;
     uint8 private constant MAX_LEVERAGE = 15;
     uint8 private constant MAX_UTILIZATION_PERCENTAGE = 1;
     uint8 private constant LIQUIDATION_FEE = 50;
 
+    uint256 private immutable i_startingTimestamp;
     address private immutable i_indexToken;
     AggregatorV3Interface private immutable i_assetPriceFeed;
     AggregatorV3Interface private immutable i_indexTokenPriceFeed;
 
     uint256 private s_depositedLiquidity;
-    uint256 private s_shortOpenInterest;
-    uint256 private s_shortOpenInterestInTokens;
+    uint256 private s_lastTimestampUpdated;
     uint256 private s_longOpenInterest;
+    uint256 private s_shortOpenInterest;
     uint256 private s_longOpenInterestInTokens;
+    uint256 private s_shortOpenInterestInTokens;
+    uint256 private s_longPrincipal;
+    uint256 private s_shortPrincipal;
     mapping(address => uint256) private s_userToCollateral;
     mapping(address => uint256) private s_userToLongOpenInterest;
     mapping(address => uint256) private s_userToShortOpenInterest;
     mapping(address => uint256) private s_userToLongOpenInterestInTokens;
     mapping(address => uint256) private s_userToShortOpenInterestInTokens;
+    /** traders' long positions divided by current borrowing percent */
+    mapping(address => uint256) private s_userToLongPrincipal;
+    /** traders' short positions divided by current borrowing percent */
+    mapping(address => uint256) private s_userToShortPrincipal;
 
     event UpdatedDepositedLiquidity(
         uint256 indexed _before,
@@ -106,6 +120,8 @@ contract Perpetual is ERC4626, ReentrancyGuard {
         i_indexToken = _indexToken;
         i_assetPriceFeed = AggregatorV3Interface(_assetPriceFeed);
         i_indexTokenPriceFeed = AggregatorV3Interface(_indexTokenPriceFeed);
+        i_startingTimestamp = block.timestamp;
+
         if (
             i_assetPriceFeed.decimals() > 18 ||
             i_indexTokenPriceFeed.decimals() > 18
@@ -122,9 +138,15 @@ contract Perpetual is ERC4626, ReentrancyGuard {
         int256 pnl = _countPnl();
 
         if (pnl > 0) {
-            return s_depositedLiquidity - SafeCast.toUint256(pnl);
+            return
+                s_depositedLiquidity -
+                SafeCast.toUint256(pnl) +
+                _accruedBorrowingFee();
         } else {
-            return s_depositedLiquidity + SafeCast.toUint256(-pnl);
+            return
+                s_depositedLiquidity +
+                SafeCast.toUint256(-pnl) +
+                _accruedBorrowingFee();
         }
     }
 
@@ -214,11 +236,19 @@ contract Perpetual is ERC4626, ReentrancyGuard {
             s_userToLongOpenInterest[msg.sender] += amount;
             s_longOpenInterestInTokens += indexTokenAmount;
             s_userToLongOpenInterestInTokens[msg.sender] += indexTokenAmount;
+
+            uint256 newPositionPrinciple = _countPrinciple(amount);
+            s_userToLongPrincipal[msg.sender] += newPositionPrinciple;
+            s_longPrincipal += newPositionPrinciple;
         } else {
             s_shortOpenInterest += amount;
             s_userToShortOpenInterest[msg.sender] += amount;
             s_shortOpenInterestInTokens += indexTokenAmount;
             s_userToShortOpenInterestInTokens[msg.sender] += indexTokenAmount;
+
+            uint256 newPositionPrinciple = _countPrinciple(amount);
+            s_userToShortPrincipal[msg.sender] += newPositionPrinciple;
+            s_shortPrincipal += newPositionPrinciple;
         }
 
         if (!_checkLiquidityReservesThreshold()) {
@@ -366,15 +396,21 @@ contract Perpetual is ERC4626, ReentrancyGuard {
         uint256 userOpenInterest;
         uint256 userOpenInterestInTokens;
         int256 totalPositionPnL;
+        uint256 borrowingFee;
+        uint256 userPrincipal;
 
         if (isLong) {
             userOpenInterest = s_userToLongOpenInterest[user];
             userOpenInterestInTokens = s_userToLongOpenInterestInTokens[user];
             totalPositionPnL = _countLongPnL(user);
+            borrowingFee = _accruedBorrowingFeeLong(user);
+            userPrincipal = s_userToLongPrincipal[user];
         } else {
             userOpenInterest = s_userToShortOpenInterest[user];
             userOpenInterestInTokens = s_userToShortOpenInterestInTokens[user];
             totalPositionPnL = _countShortPnL(user);
+            borrowingFee = _accruedBorrowingFeeShort(user);
+            userPrincipal = s_userToShortPrincipal[user];
         }
 
         if (
@@ -388,6 +424,9 @@ contract Perpetual is ERC4626, ReentrancyGuard {
             SafeCast.toInt256(indexTokenAmount)) /
             SafeCast.toInt256(userOpenInterestInTokens);
 
+        uint256 realizedBorrowingFee = (borrowingFee * indexTokenAmount) /
+            userOpenInterestInTokens;
+
         if (realizedPnl > 0) {
             s_depositedLiquidity -= SafeCast.toUint256(realizedPnl);
             SafeERC20.safeTransfer(
@@ -397,28 +436,41 @@ contract Perpetual is ERC4626, ReentrancyGuard {
             );
         }
         if (realizedPnl < 0) {
-            s_userToCollateral[user] -= SafeCast.toUint256(-realizedPnl);
+            uint256 loss = SafeCast.toUint256(-realizedPnl);
+            s_userToCollateral[user] -= loss;
+            s_depositedLiquidity += loss;
         }
 
+        s_userToCollateral[user] -= realizedBorrowingFee;
+        s_depositedLiquidity += realizedBorrowingFee;
+
         if (isLong) {
-            uint256 longInterest = (s_userToLongOpenInterest[user] *
-                indexTokenAmount) / userOpenInterestInTokens;
+            uint256 longInterest = (userOpenInterest * indexTokenAmount) /
+                userOpenInterestInTokens;
+            uint256 longPrinciple = (userPrincipal * indexTokenAmount) /
+                userOpenInterestInTokens;
 
             unchecked {
                 s_userToLongOpenInterest[user] -= longInterest;
                 s_userToLongOpenInterestInTokens[user] -= indexTokenAmount;
                 s_longOpenInterest -= longInterest;
                 s_longOpenInterestInTokens -= indexTokenAmount;
+                s_userToLongPrincipal[user] -= longPrinciple;
+                s_longPrincipal -= longPrinciple;
             }
         } else {
-            uint256 shortInterest = (s_userToShortOpenInterest[user] *
-                indexTokenAmount) / userOpenInterestInTokens;
+            uint256 shortInterest = (userOpenInterest * indexTokenAmount) /
+                userOpenInterestInTokens;
+            uint256 shortPrinciple = (userPrincipal * indexTokenAmount) /
+                userOpenInterestInTokens;
 
             unchecked {
                 s_userToShortOpenInterest[user] -= shortInterest;
                 s_userToShortOpenInterestInTokens[user] -= indexTokenAmount;
                 s_shortOpenInterest -= shortInterest;
                 s_shortOpenInterestInTokens -= indexTokenAmount;
+                s_userToShortPrincipal[user] -= shortPrinciple;
+                s_shortPrincipal -= shortPrinciple;
             }
         }
 
@@ -552,7 +604,7 @@ contract Perpetual is ERC4626, ReentrancyGuard {
         uint256 positionAmount
     ) internal view returns (int256) {
         int256 denominator = (SafeCast.toInt256(s_userToCollateral[user]) +
-            _countPnl(user));
+            _countPnl(user)) - SafeCast.toInt256(_accruedBorrowingFee(user));
 
         if (denominator <= 0 && positionAmount > 0) {
             return type(int256).max;
@@ -563,6 +615,137 @@ contract Perpetual is ERC4626, ReentrancyGuard {
         }
 
         return SafeCast.toInt256(positionAmount * PRECISION) / denominator;
+    }
+
+    function _now() internal view returns (uint256) {
+        return block.timestamp;
+    }
+
+    /**
+     * Returns current borrowing index in 1e10 decimals.
+     *
+     * At the beginning of the contract deployment the borrowing percent equals 0,
+     * and the borrowing index equals 1
+     * After time passes, borrowing index equals:
+     * borrowingIndex = (time passed * percent per second) + initial borrowing index =
+     * = (time passed * percent per second) + 1
+     *
+     * As the index has 1e10 decimals (multiplied by BORROWING_PRECISION),
+     * principal calculation = position size * BORROWING_PRECISION / index
+     * present position size = pricniple * index / BORROWING_PRECISION
+     */
+    function _currenBorrowingIndex() internal view returns (uint256) {
+        return
+            (((_now() - i_startingTimestamp) * BORROWING_PRECISION) /
+                BORROWING_PER_SHARE_PER_SECOND) + (1 * BORROWING_PRECISION);
+    }
+
+    function _countPrinciple(uint256 amount) internal view returns (uint256) {
+        return (amount * BORROWING_PRECISION) / _currenBorrowingIndex();
+    }
+
+    function _countOpenLongInterestWithBorrowingFees(
+        address user
+    ) internal view returns (uint256) {
+        return
+            (s_userToLongOpenInterest[user] * _currenBorrowingIndex()) /
+            BORROWING_PRECISION;
+    }
+
+    function _countOpenLongInterestWithBorrowingFees()
+        internal
+        view
+        returns (uint256)
+    {
+        return
+            (s_longOpenInterest * _currenBorrowingIndex()) /
+            BORROWING_PRECISION;
+    }
+
+    function _countOpenShortInterestWithBorrowingFees(
+        address user
+    ) internal view returns (uint256) {
+        return
+            (s_userToShortOpenInterest[user] * _currenBorrowingIndex()) /
+            BORROWING_PRECISION;
+    }
+
+    function _countOpenShortInterestWithBorrowingFees()
+        internal
+        view
+        returns (uint256)
+    {
+        return
+            (s_shortOpenInterest * _currenBorrowingIndex()) /
+            BORROWING_PRECISION;
+    }
+
+    function _accruedBorrowingFeeLong(
+        address user
+    ) internal view returns (uint256) {
+        return
+            _countOpenLongInterestWithBorrowingFees(user) -
+            s_userToLongOpenInterest[user];
+    }
+
+    function _accruedBorrowingFeeLong() internal view returns (uint256) {
+        return _countOpenLongInterestWithBorrowingFees() - s_longOpenInterest;
+    }
+
+    function _accruedBorrowingFeeShort(
+        address user
+    ) internal view returns (uint256) {
+        return
+            _countOpenShortInterestWithBorrowingFees(user) -
+            s_userToShortOpenInterest[user];
+    }
+
+    function _accruedBorrowingFeeShort() internal view returns (uint256) {
+        return _countOpenShortInterestWithBorrowingFees() - s_shortOpenInterest;
+    }
+
+    function _accruedBorrowingFee(
+        address user
+    ) internal view returns (uint256) {
+        return _accruedBorrowingFeeLong(user) + _accruedBorrowingFeeShort(user);
+    }
+
+    function _accruedBorrowingFee() internal view returns (uint256) {
+        return _accruedBorrowingFeeLong() + _accruedBorrowingFeeShort();
+    }
+
+    // private to public external
+
+    function accruedBorrowingFeeLong(
+        address user
+    ) external view returns (uint256) {
+        return _accruedBorrowingFeeLong(user);
+    }
+
+    function accruedBorrowingFeeLong() external view returns (uint256) {
+        return _accruedBorrowingFeeLong();
+    }
+
+    function accruedBorrowingFeeShort(
+        address user
+    ) external view returns (uint256) {
+        return _accruedBorrowingFeeShort(user);
+    }
+
+    function accruedBorrowingFeeShort() external view returns (uint256) {
+        return _accruedBorrowingFeeShort();
+    }
+
+    function accruedBorrowingFee(address user) external view returns (uint256) {
+        return _accruedBorrowingFee(user);
+    }
+
+    function accruedBorrowingFee() external view returns (uint256) {
+        return _accruedBorrowingFee();
+    }
+
+    function currenBorrowinIndex() external view returns (uint256) {
+        return _currenBorrowingIndex();
     }
 
     function currentUserLeverage(
@@ -671,5 +854,21 @@ contract Perpetual is ERC4626, ReentrancyGuard {
 
     function getAssetTokenPriceFeed() external view returns (address) {
         return address(i_assetPriceFeed);
+    }
+
+    function getBorrowingPerSharePerSecond() external pure returns (uint256) {
+        return BORROWING_PER_SHARE_PER_SECOND;
+    }
+
+    function getUserLongPrincipal(
+        address user
+    ) external view returns (uint256) {
+        return s_userToLongPrincipal[user];
+    }
+
+    function getUserShortPrincipal(
+        address user
+    ) external view returns (uint256) {
+        return s_userToShortPrincipal[user];
     }
 }

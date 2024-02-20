@@ -1068,7 +1068,10 @@ contract PerpetualTest is Test {
         vm.stopPrank();
 
         assertEq(ERC20Mock(asset).balanceOf(PLAYER2), 0);
-        assertEq(perpetual.depositedLiquidity(), 2 * MINT_ASSET_AMOUNT);
+        assertEq(
+            perpetual.depositedLiquidity(),
+            (2 * MINT_ASSET_AMOUNT) + (uint256(-pnl) / 4)
+        );
         assertEq(
             perpetual.getUserCollatral(PLAYER2),
             MINT_ASSET_AMOUNT - (uint256(-pnl) / 4)
@@ -1139,7 +1142,10 @@ contract PerpetualTest is Test {
         vm.stopPrank();
 
         assertEq(ERC20Mock(asset).balanceOf(PLAYER2), 0);
-        assertEq(perpetual.depositedLiquidity(), 2 * MINT_ASSET_AMOUNT);
+        assertEq(
+            perpetual.depositedLiquidity(),
+            (2 * MINT_ASSET_AMOUNT + (uint256(-pnl) / 4))
+        );
         assertEq(
             perpetual.getUserCollatral(PLAYER2),
             MINT_ASSET_AMOUNT - (uint256(-pnl) / 4)
@@ -1267,6 +1273,7 @@ contract PerpetualTest is Test {
         assertEq(perpetual.getLongOpenInterestInTokens(), 0);
         assertEq(perpetual.getShortOpenInterest(), 0);
         assertEq(perpetual.getShortOpenInterestInTokens(), 0);
+        assertEq(perpetual.depositedLiquidity(), MINT_ASSET_AMOUNT + userLoss);
     }
 
     function testShouldLiquidateInvalidShortPositionSuccessfully()
@@ -1343,6 +1350,7 @@ contract PerpetualTest is Test {
         assertEq(perpetual.getLongOpenInterestInTokens(), 0);
         assertEq(perpetual.getShortOpenInterest(), 0);
         assertEq(perpetual.getShortOpenInterestInTokens(), 0);
+        assertEq(perpetual.depositedLiquidity(), MINT_ASSET_AMOUNT + userLoss);
     }
 
     function testShouldLiquidateInvalidBothShortAndLongPositionSuccessfully()
@@ -1426,5 +1434,253 @@ contract PerpetualTest is Test {
         assertEq(perpetual.getLongOpenInterestInTokens(), 0);
         assertEq(perpetual.getShortOpenInterest(), 0);
         assertEq(perpetual.getShortOpenInterestInTokens(), 0);
+        assertEq(
+            perpetual.depositedLiquidity(),
+            (MINT_ASSET_AMOUNT * 2) + userShortLoss - userLongProfit
+        );
+    }
+
+    function testCurrentBorrowingIndexShouldEqualOneAtTheBeginnigBlock()
+        public
+    {
+        assertEq(perpetual.currenBorrowinIndex(), 1e10);
+    }
+
+    function testCurrentBorrowingIndexShouldGrowInNextBlocks() public {
+        uint256 secondsPassed = 10_000;
+
+        uint256 newBorrowingIndex = 1e10 +
+            (secondsPassed * 1e10) /
+            perpetual.getBorrowingPerSharePerSecond();
+
+        vm.warp(block.timestamp + secondsPassed);
+
+        assert(perpetual.currenBorrowinIndex() > 1e10);
+        assertEq(perpetual.currenBorrowinIndex(), newBorrowingIndex);
+    }
+
+    function testShouldSaveCorrectLongPrincipalAfterAddingPosition()
+        public
+        skipSepolia
+        playerDepositedAsset
+    {
+        uint256 secondsPassed = 10_000;
+
+        uint256 newBorrowingIndex = 1e10 +
+            (secondsPassed * 1e10) /
+            perpetual.getBorrowingPerSharePerSecond();
+
+        vm.warp(block.timestamp + secondsPassed);
+
+        ERC20Mock(asset).mint(PLAYER2, MINT_ASSET_AMOUNT);
+        vm.startPrank(PLAYER2);
+        ERC20Mock(asset).approve(address(perpetual), MINT_ASSET_AMOUNT);
+        perpetual.addCollateral(MINT_ASSET_AMOUNT);
+        perpetual.addPosition(MINT_ASSET_AMOUNT, true);
+        vm.stopPrank();
+
+        uint256 principal = (MINT_ASSET_AMOUNT * 1e10) / newBorrowingIndex;
+
+        assertEq(perpetual.getUserLongPrincipal(PLAYER2), principal);
+    }
+
+    function testShouldSaveCorrectShortPrincipalAfterAddingPosition()
+        public
+        skipSepolia
+        playerDepositedAsset
+    {
+        uint256 secondsPassed = 10_000;
+
+        uint256 newBorrowingIndex = 1e10 +
+            (secondsPassed * 1e10) /
+            perpetual.getBorrowingPerSharePerSecond();
+
+        vm.warp(block.timestamp + secondsPassed);
+
+        ERC20Mock(asset).mint(PLAYER2, MINT_ASSET_AMOUNT);
+        vm.startPrank(PLAYER2);
+        ERC20Mock(asset).approve(address(perpetual), MINT_ASSET_AMOUNT);
+        perpetual.addCollateral(MINT_ASSET_AMOUNT);
+        perpetual.addPosition(MINT_ASSET_AMOUNT, false);
+        vm.stopPrank();
+
+        uint256 principal = (MINT_ASSET_AMOUNT * 1e10) / newBorrowingIndex;
+
+        assertEq(perpetual.getUserShortPrincipal(PLAYER2), principal);
+    }
+
+    function testShouldSaveCorrectLongPrincipalAfterAddingTwoPositions()
+        public
+        skipSepolia
+        playerDepositedAsset
+        playerDepositedAsset
+    {
+        uint256 initialTime = block.timestamp;
+
+        uint256 secondsPassed = 10_000;
+
+        uint256 newFirstBorrowingIndex = 1e10 +
+            (secondsPassed * 1e10) /
+            perpetual.getBorrowingPerSharePerSecond();
+
+        vm.warp(initialTime + secondsPassed);
+
+        ERC20Mock(asset).mint(PLAYER2, MINT_ASSET_AMOUNT);
+        vm.startPrank(PLAYER2);
+        ERC20Mock(asset).approve(address(perpetual), MINT_ASSET_AMOUNT);
+        perpetual.addCollateral(MINT_ASSET_AMOUNT);
+        perpetual.addPosition(MINT_ASSET_AMOUNT, true);
+        vm.stopPrank();
+
+        uint256 principal = (MINT_ASSET_AMOUNT * 1e10) / newFirstBorrowingIndex;
+
+        assertEq(perpetual.getUserLongPrincipal(PLAYER2), principal);
+
+        uint256 newSecondBorrowingIndex = 1e10 +
+            (secondsPassed * 2 * 1e10) /
+            perpetual.getBorrowingPerSharePerSecond();
+
+        vm.warp(initialTime + (secondsPassed * 2));
+
+        ERC20Mock(asset).mint(PLAYER2, MINT_ASSET_AMOUNT);
+        vm.startPrank(PLAYER2);
+        ERC20Mock(asset).approve(address(perpetual), MINT_ASSET_AMOUNT);
+        perpetual.addCollateral(MINT_ASSET_AMOUNT);
+        perpetual.addPosition(MINT_ASSET_AMOUNT, true);
+        vm.stopPrank();
+
+        uint256 newPrincipal = (MINT_ASSET_AMOUNT * 1e10) /
+            newSecondBorrowingIndex;
+
+        assertEq(
+            perpetual.getUserLongPrincipal(PLAYER2),
+            principal + newPrincipal
+        );
+    }
+
+    function testShouldAccrueCorrectBorrowingFeeForLongPosition()
+        public
+        skipSepolia
+        playerDepositedAsset
+    {
+        ERC20Mock(asset).mint(PLAYER2, MINT_ASSET_AMOUNT);
+        vm.startPrank(PLAYER2);
+        ERC20Mock(asset).approve(address(perpetual), MINT_ASSET_AMOUNT);
+        perpetual.addCollateral(MINT_ASSET_AMOUNT);
+        perpetual.addPosition(MINT_ASSET_AMOUNT, true);
+        vm.stopPrank();
+
+        uint256 secondsPassed = 10_000;
+
+        uint256 newBorrowingIndex = 1e10 +
+            (secondsPassed * 1e10) /
+            perpetual.getBorrowingPerSharePerSecond();
+
+        vm.warp(block.timestamp + secondsPassed);
+
+        uint256 positionWithBorrowingFees = (MINT_ASSET_AMOUNT *
+            newBorrowingIndex) / 1e10;
+
+        assertEq(
+            perpetual.accruedBorrowingFeeLong(PLAYER2),
+            positionWithBorrowingFees - MINT_ASSET_AMOUNT
+        );
+        assertEq(
+            perpetual.accruedBorrowingFee(PLAYER2),
+            positionWithBorrowingFees - MINT_ASSET_AMOUNT
+        );
+    }
+
+    function testShouldAccrueCorrectBorrowingFeeForShortPosition()
+        public
+        skipSepolia
+        playerDepositedAsset
+    {
+        ERC20Mock(asset).mint(PLAYER2, MINT_ASSET_AMOUNT);
+        vm.startPrank(PLAYER2);
+        ERC20Mock(asset).approve(address(perpetual), MINT_ASSET_AMOUNT);
+        perpetual.addCollateral(MINT_ASSET_AMOUNT);
+        perpetual.addPosition(MINT_ASSET_AMOUNT, false);
+        vm.stopPrank();
+
+        uint256 secondsPassed = 10_000;
+
+        uint256 newBorrowingIndex = 1e10 +
+            (secondsPassed * 1e10) /
+            perpetual.getBorrowingPerSharePerSecond();
+
+        vm.warp(block.timestamp + secondsPassed);
+
+        uint256 positionWithBorrowingFees = (MINT_ASSET_AMOUNT *
+            newBorrowingIndex) / 1e10;
+
+        assertEq(
+            perpetual.accruedBorrowingFeeShort(PLAYER2),
+            positionWithBorrowingFees - MINT_ASSET_AMOUNT
+        );
+        assertEq(
+            perpetual.accruedBorrowingFee(PLAYER2),
+            positionWithBorrowingFees - MINT_ASSET_AMOUNT
+        );
+    }
+
+    function testShouldAccrueCorrectBorrowingFeeForShortAndLongPosition()
+        public
+        skipSepolia
+        playerDepositedAsset
+    {
+        ERC20Mock(asset).mint(PLAYER2, MINT_ASSET_AMOUNT);
+        vm.startPrank(PLAYER2);
+        ERC20Mock(asset).approve(address(perpetual), MINT_ASSET_AMOUNT);
+        perpetual.addCollateral(MINT_ASSET_AMOUNT);
+        perpetual.addPosition(MINT_ASSET_AMOUNT / 2, true);
+        perpetual.addPosition(MINT_ASSET_AMOUNT / 2, false);
+        vm.stopPrank();
+
+        uint256 secondsPassed = 10_000;
+
+        uint256 newBorrowingIndex = 1e10 +
+            (secondsPassed * 1e10) /
+            perpetual.getBorrowingPerSharePerSecond();
+
+        vm.warp(block.timestamp + secondsPassed);
+
+        uint256 positionWithBorrowingFees = (MINT_ASSET_AMOUNT *
+            newBorrowingIndex) / 1e10;
+
+        assertEq(
+            perpetual.accruedBorrowingFeeShort(PLAYER2),
+            (positionWithBorrowingFees / 2) - (MINT_ASSET_AMOUNT / 2)
+        );
+        assertEq(
+            perpetual.accruedBorrowingFeeLong(PLAYER2),
+            (positionWithBorrowingFees / 2) - (MINT_ASSET_AMOUNT / 2)
+        );
+        assertEq(
+            perpetual.accruedBorrowingFee(PLAYER2),
+            positionWithBorrowingFees - MINT_ASSET_AMOUNT
+        );
+    }
+
+    function testShouldAccrueTenPercentPerYearOfBorrowingFee()
+        public
+        skipSepolia
+        playerDepositedAsset
+    {
+        ERC20Mock(asset).mint(PLAYER2, MINT_ASSET_AMOUNT);
+        vm.startPrank(PLAYER2);
+        ERC20Mock(asset).approve(address(perpetual), MINT_ASSET_AMOUNT);
+        perpetual.addCollateral(MINT_ASSET_AMOUNT);
+        perpetual.addPosition(MINT_ASSET_AMOUNT, true);
+        vm.stopPrank();
+
+        uint256 secondsPassed = 31536000; // one year
+
+        vm.warp(block.timestamp + secondsPassed);
+
+        assertEq(
+            perpetual.accruedBorrowingFeeLong(PLAYER2),
+            MINT_ASSET_AMOUNT / 10
+        );
     }
 }
