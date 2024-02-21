@@ -1,4 +1,4 @@
-###Description:
+# Description:
 
 - Liquidity Providers can deposit and withdraw liquidity.
   1. deposit USDC/WBTC
@@ -18,7 +18,8 @@
 - Traders can never modify their position such that it would make the position liquidatable.
 - Traders are charged a `borrowingFee` which accrues as a function of their position size and the length of time the position is open.
 
-###Coverage:
-![image](https://github.com/MarsWhiteHacker/Prepetual/assets/98659734/91834f54-fae2-4c0f-ba65-40ae9e3cbbfd)
+# Coverage:
+![image](https://github.com/MarsWhiteHacker/Prepetual/assets/98659734/7339d2ba-1f46-45b0-8593-6636c951120d)
+
 
 
